@@ -1,0 +1,6 @@
+fastapi
+uvicorn[standard]
+python-dotenv
+apscheduler
+aio_pika # For async RabbitMQ publishing
+httpx # For async HTTP requests to User Service

@@ -1,0 +1,7 @@
+fastapi
+uvicorn[standard]
+strawberry-graphql[fastapi]
+httpx # Async HTTP client
+python-dotenv
+python-jose[cryptography] # For JWT verification
+pydantic[email] # Good practice
