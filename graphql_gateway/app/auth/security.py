@@ -2,7 +2,7 @@ import logging
 from typing import Optional
 
 from jose import JWTError, jwt
-from graphql_gateway.app.core.config import settings
+from ..core.config import settings
 
 logger = logging.getLogger(__name__)
 

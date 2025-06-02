@@ -1,6 +1,6 @@
 fastapi
 uvicorn[standard]
 pymongo
-pydantic[email] # Though email might not be directly validated here, good practice
 python-dotenv
+pydantic-settings
 aio_pika # Asynchronous RabbitMQ client

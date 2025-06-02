@@ -1,218 +1,172 @@
+# notification_service/app/events/consumer.py
 import asyncio
+import aio_pika
 import json
-import logging
 from typing import Optional
 
-import aio_pika
-from aio_pika import IncomingMessage, RobustConnection, ExchangeType
+from ..core.config import settings, logger
+from ..db import crud # Assuming synchronous CRUD for now
+from ..schemas.notification import NotificationCreate, NotificationContent # Ensure correct Pydantic models
 from pydantic import ValidationError
 
-from notification_service.app.core.config import settings
-from notification_service.app.schemas.notification import NotificationCreate, NotificationContent
-from notification_service.app.db import crud # Using sync crud for now
+# Global variable to hold the main consumer task
+_consumer_task: Optional[asyncio.Task] = None
 
-logger = logging.getLogger(__name__)
-
-async def process_notification_event(message: IncomingMessage):
-    """Callback function to process messages received from RabbitMQ."""
-    async with message.process(requeue=False): # Auto-ack if processing succeeds, don't requeue by default
+async def _process_message(message: aio_pika.IncomingMessage):
+    """
+    Internal callback function to process messages received from RabbitMQ.
+    """
+    async with message.process(requeue=False): # Auto-ack on success, auto-nack on exception if requeue=False
         try:
-            data = json.loads(message.body.decode('utf-8'))
-            logger.info(f"Received raw message: {data}")
+            raw_body = message.body.decode('utf-8')
+            logger.info(f"Consumer received raw message: {raw_body}")
+            data = json.loads(raw_body)
 
-            # Validate required fields
-            if not all(k in data for k in ('userId', 'type', 'content')):
-                 logger.error(f"Missing required fields in message: {data}")
-                 # Explicitly nack and don't requeue (or send to DLQ if configured)
-                 # await message.nack(requeue=False) # process context does this on exception
-                 return # Skip processing
+            # Basic validation for required top-level keys
+            required_keys = ['userId', 'type', 'content']
+            if not all(k in data for k in required_keys):
+                logger.error(f"Missing required fields in message: {data}. Skipping.")
+                return
 
-            # Further validation for content structure
             content_data = data.get('content', {})
-            if not isinstance(content_data, dict) or not all(k in content_data for k in ('title', 'body')):
-                 logger.error(f"Invalid 'content' structure in message: {content_data}")
-                 return # Skip processing
+            if not isinstance(content_data, dict) or not all(k in content_data for k in ['title', 'body']):
+                logger.error(f"Invalid 'content' structure: {content_data} in message: {data}. Skipping.")
+                return
 
-            # Create NotificationContent object
+            # Create Pydantic models
             notification_content = NotificationContent(
                 title=content_data.get('title'),
                 body=content_data.get('body'),
-                link=content_data.get('link') # Optional
+                link=content_data.get('link') 
             )
             
-            # Create NotificationCreate object
-            notification_data = NotificationCreate(
-                userId=data.get('userId'),
+            notification_to_create = NotificationCreate(
+                userId=str(data.get('userId')), # Ensure userId is string
                 type=data.get('type'),
                 content=notification_content
-                # sentAt and read have defaults
             )
 
-            logger.info(f"Attempting to store notification for user: {notification_data.userId}")
-
+            logger.info(f"Attempting to store notification for user: {notification_to_create.userId}, type: {notification_to_create.type}")
             
-            # Direct synchronous call (simpler for now, blocks):
-            created_notification = crud.create_notification_sync(notification_data)
+            # Assuming crud.create_notification is synchronous
+            # If it were async, you would await it.
+            # In a real async app, you might use run_in_threadpool for sync DB operations.
+            created_notification = crud.create_notification(notification_in=notification_to_create)
 
             if created_notification:
                 logger.info(f"Successfully stored notification ID {created_notification.id} for user {created_notification.userId}")
-                # Message is automatically acked by `message.process()` context manager if no exception
             else:
-                logger.error(f"Failed to store notification for user {notification_data.userId}. Message will be NACKed.")
-                # Raise an exception to trigger NACK from the context manager
-                raise RuntimeError("Failed to store notification in DB")
+                logger.error(f"Failed to store notification for user {notification_to_create.userId}. This message will be NACKed implicitly by raising error.")
+                raise RuntimeError("Failed to store notification in DB, message will be NACKed.") # Will NACK
 
         except json.JSONDecodeError:
-            logger.error(f"Failed to decode JSON message: {message.body}")
-            # Let context manager handle NACK
-            raise
+            logger.error(f"Failed to decode JSON message: {message.body}", exc_info=True)
+            raise # Re-raise to NACK the message
         except ValidationError as e:
-            logger.error(f"Message validation failed: {e}. Message: {message.body.decode()}")
-            # Let context manager handle NACK
-            raise
+            logger.error(f"Message validation failed: {e}. Raw message: {message.body.decode()}", exc_info=True)
+            raise # Re-raise to NACK the message
         except Exception as e:
-            logger.error(f"Unhandled error processing message: {e}")
+            logger.error(f"Unhandled error processing message: {e}. Raw message: {message.body.decode()}", exc_info=True)
+            raise # Re-raise to NACK the message
 
-async def consume_notifications(connection: RobustConnection) -> Optional[aio_pika.abc.AbstractChannel]:
-    """Sets up the RabbitMQ consumer."""
-    if not connection or connection.is_closed:
-        logger.error("RabbitMQ connection is not available.")
-        return None
 
+async def _run_consumer_logic():
+    """The core logic for connecting, declaring, and consuming messages."""
+    connection: Optional[aio_pika.RobustConnection] = None
     try:
-        channel = await connection.channel()
-        await channel.set_qos(prefetch_count=10) # Process up to 10 messages concurrently
-
-        # Declare the exchange (idempotent)
-        exchange = await channel.declare_exchange(
-            settings.NOTIFICATION_EVENTS_EXCHANGE,
-            ExchangeType.FANOUT, # Or DIRECT/TOPIC depending on producer setup
-            durable=True
-        )
-
-        # Declare the queue (idempotent)
-        queue = await channel.declare_queue(
-            settings.NOTIFICATION_QUEUE,
-            durable=True # Ensure queue survives broker restarts
-            # arguments={"x-dead-letter-exchange": "dlx_exchange_name"} # Optional DLQ setup
-        )
-
-        # Bind the queue to the exchange
-        await queue.bind(exchange, routing_key=settings.BINDING_KEY) # Use configured binding key
-
-        logger.info(f"Declared Exchange '{settings.NOTIFICATION_EVENTS_EXCHANGE}', Queue '{settings.NOTIFICATION_QUEUE}'")
-        logger.info(f"[*] Waiting for messages in queue '{settings.NOTIFICATION_QUEUE}'. To exit press CTRL+C")
-
-        # Start consuming messages
-        await queue.consume(process_notification_event)
+        logger.info(f"Consumer logic: Attempting robust connection to RabbitMQ at {settings.RABBITMQ_URL}")
+        # RobustConnection will handle retries for connecting internally
+        connection = await aio_pika.connect_robust(settings.RABBITMQ_URL, timeout=settings.RABBITMQ_CONNECT_TIMEOUT or 30)
         
-        return channel # Return the channel so it can be potentially managed/closed later
+        async with connection: # Use connection as a context manager
+            logger.info("Consumer logic: Successfully connected to RabbitMQ.")
+            channel = await connection.channel()
+            await channel.set_qos(prefetch_count=settings.RABBITMQ_CONSUMER_PREFETCH_COUNT or 10)
 
-    except aio_pika.exceptions.AMQPConnectionError as e:
-        logger.error(f"AMQP Connection Error during consumer setup: {e}")
-        return None
+            logger.info(f"Consumer logic: Declaring exchange '{settings.NOTIFICATION_EVENTS_EXCHANGE}' (type: {settings.NOTIFICATION_EXCHANGE_TYPE}, durable: True)")
+            exchange_type = getattr(aio_pika.ExchangeType, settings.NOTIFICATION_EXCHANGE_TYPE.upper(), aio_pika.ExchangeType.FANOUT)
+            exchange = await channel.declare_exchange(
+                settings.NOTIFICATION_EVENTS_EXCHANGE, 
+                exchange_type,
+                durable=True
+            )
+            
+            logger.info(f"Consumer logic: Declaring queue '{settings.NOTIFICATION_QUEUE}' (durable: True)")
+            queue = await channel.declare_queue(settings.NOTIFICATION_QUEUE, durable=True)
+            
+            logger.info(f"Consumer logic: Binding queue '{settings.NOTIFICATION_QUEUE}' to exchange '{settings.NOTIFICATION_EVENTS_EXCHANGE}' with binding key '{settings.BINDING_KEY or ""}'")
+            await queue.bind(exchange, routing_key=settings.BINDING_KEY or "") 
+            
+            logger.info(f"Consumer logic: Starting to consume from queue '{settings.NOTIFICATION_QUEUE}'")
+            await queue.consume(_process_message)
+            
+            logger.info(" [*] Consumer is waiting for messages. This task will run indefinitely until cancelled.")
+            await asyncio.Future() # Keep this coroutine alive until cancelled
+
+    except asyncio.CancelledError:
+        logger.info("Consumer logic task was cancelled.")
     except Exception as e:
-        logger.error(f"Failed to setup RabbitMQ consumer: {e}")
-        # Potentially attempt retry logic here or in the connection setup
-        return None
-
-# Global variable to hold the consumer task
-consumer_task = None
-rabbitmq_connection = None
-rabbitmq_channel = None
-
-async def connect_to_rabbitmq() -> Optional[RobustConnection]:
-    global rabbitmq_connection
-    logger.info("Connecting to RabbitMQ...")
-    try:
-        # Ensure event loop is running, useful if called outside async context sometimes
-        loop = asyncio.get_event_loop() 
-        connection = await aio_pika.connect_robust(
-            settings.RABBITMQ_URL,
-            loop=loop,
-            timeout=10 # Connection timeout
-        )
-        logger.info("RabbitMQ connection successful.")
-        rabbitmq_connection = connection
-        
-        # Add connection lost callback for monitoring/reconnection logic
-        connection.add_close_callback(on_rabbitmq_connection_close)
-        connection.add_reconnect_callback(on_rabbitmq_connection_reconnect)
-
-        return connection
-    except aio_pika.exceptions.AMQPConnectionError as e:
-        logger.error(f"Could not connect to RabbitMQ after multiple attempts: {e}")
-        rabbitmq_connection = None
-        return None # Allow startup to continue, maybe retry later
-    except Exception as e:
-        logger.error(f"Generic error connecting to RabbitMQ: {e}")
-        rabbitmq_connection = None
-        return None
+        logger.error(f"Major error in consumer logic (e.g., initial connection failed after retries): {e}", exc_info=True)
+        # If RobustConnection fails all its retries, it raises.
+        # This task might exit, and start_consuming might try to restart it.
+        raise # Re-raise to let the manager know this attempt failed critically
+    finally:
+        if connection and not connection.is_closed:
+            await connection.close()
+            logger.info("Consumer logic: RabbitMQ connection closed in finally block.")
 
 
-def on_rabbitmq_connection_close(sender, exc):
-    global rabbitmq_connection
-    logger.warning(f"RabbitMQ connection closed. Exception: {exc}")
-    rabbitmq_connection = None # Mark connection as lost
+async def start_consuming(): # This is the function main.py will call
+    """Starts the RabbitMQ consumer logic as a background task if not already running."""
+    global _consumer_task
+    if _consumer_task and not _consumer_task.done():
+        logger.info("Consumer task is already running.")
+        return
 
-def on_rabbitmq_connection_reconnect(sender):
-    global rabbitmq_connection
-    logger.info("RabbitMQ connection re-established.")
-    # We might need to restart consumers if they weren't robustly handled by the channel/connection
-    # For now, assume connect_robust handles restarting consumers on the channel.
+    logger.info("Starting RabbitMQ consumer background task...")
+    # We wrap _run_consumer_logic in another task that can retry starting it
+    async def supervised_consumer_run():
+        retry_delay = 5
+        max_retries = 3 # Example: limit initial startup retries
+        attempt = 0
+        while True:
+            try:
+                await _run_consumer_logic()
+                logger.info("Consumer logic exited normally (should not happen if using asyncio.Future()).")
+                break # Exit supervisor if _run_consumer_logic exits normally
+            except asyncio.CancelledError:
+                logger.info("Supervised consumer run cancelled.")
+                break
+            except Exception as e:
+                attempt +=1
+                logger.error(f"Consumer logic failed critically (attempt {attempt}): {e}. Retrying in {retry_delay}s if attempts < {max_retries}.")
+                if attempt >= max_retries:
+                    logger.error("Max retries reached for starting consumer logic. Giving up.")
+                    break
+                await asyncio.sleep(retry_delay)
+                retry_delay = min(retry_delay * 2, 60) # Exponential backoff up to 60s
+
+    _consumer_task = asyncio.create_task(supervised_consumer_run())
+    logger.info(f"Consumer background task created: {_consumer_task.get_name()}")
 
 
-async def start_consumer_background():
-    """Connects to RabbitMQ and starts the consumer in the background."""
-    global consumer_task, rabbitmq_connection, rabbitmq_channel
+async def stop_consuming(task: Optional[asyncio.Task] = None): # main.py can pass the task
+    """Stops the RabbitMQ consumer task."""
+    global _consumer_task
+    task_to_stop = task or _consumer_task # Prefer passed task, fallback to global
     
-    # Check if already running
-    if consumer_task and not consumer_task.done():
-         logger.info("Consumer task already running.")
-         return
-
-    connection = await connect_to_rabbitmq()
-    if connection:
-        rabbitmq_channel = await consume_notifications(connection)
-        if rabbitmq_channel:
-            logger.info("RabbitMQ Consumer setup complete and running.")
-           
-            consumer_task = asyncio.create_task
-        else:
-             logger.error("Failed to start RabbitMQ consumer.")
-             # No need to close connection here, connect_robust handles retries
-    else:
-        logger.error("Failed to establish RabbitMQ connection for consumer.")
-        # Implement retry logic if needed, e.g., using asyncio.sleep and recalling start_consumer_background
-
-
-async def stop_consumer_background():
-    """Stops the RabbitMQ consumer and closes connection."""
-    global consumer_task, rabbitmq_connection, rabbitmq_channel
-    logger.info("Stopping RabbitMQ consumer...")
-
-  
-    if consumer_task and not consumer_task.done():
-        consumer_task.cancel()
+    if task_to_stop and not task_to_stop.done():
+        logger.info(f"Attempting to stop/cancel consumer task: {task_to_stop.get_name()}")
+        task_to_stop.cancel()
         try:
-            await consumer_task
+            await task_to_stop
+            logger.info(f"Consumer task {task_to_stop.get_name()} awaited after cancellation.")
         except asyncio.CancelledError:
-            logger.info("Consumer task cancelled.")
-
-    if rabbitmq_channel and not rabbitmq_channel.is_closed:
-        try:
-            await rabbitmq_channel.close()
-            logger.info("RabbitMQ channel closed.")
+            logger.info(f"Consumer task {task_to_stop.get_name()} successfully cancelled.")
         except Exception as e:
-            logger.error(f"Error closing RabbitMQ channel: {e}")
-        rabbitmq_channel = None
-
-    if rabbitmq_connection and not rabbitmq_connection.is_closed:
-        try:
-            await rabbitmq_connection.close()
-            logger.info("RabbitMQ connection closed.")
-        except Exception as e:
-            logger.error(f"Error closing RabbitMQ connection: {e}")
-        rabbitmq_connection = None
-
-    consumer_task = None # Reset task variable
+            logger.error(f"Error during consumer task {task_to_stop.get_name()} cancellation/await: {e}", exc_info=True)
+    else:
+        logger.info("Consumer task not running or already stopped/cancelled.")
+    
+    if task_to_stop == _consumer_task: # If we stopped the global one, clear it
+        _consumer_task = None

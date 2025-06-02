@@ -2,11 +2,11 @@ from fastapi import APIRouter, Depends, HTTPException, status
 from fastapi.security import OAuth2PasswordRequestForm
 from datetime import timedelta
 
-from user_service.app.core import security
-from user_service.app.core.config import settings
-from user_service.app.schemas import token as token_schema
-from user_service.app.schemas import user as user_schema
-from user_service.app.db import crud # Use sync crud
+from ..core import security
+from ..core.config import settings
+from ..schemas import token as token_schema
+from ..schemas import user as user_schema
+from ..db import crud # Use sync crud
 
 router = APIRouter()
 

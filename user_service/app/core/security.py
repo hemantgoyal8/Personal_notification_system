@@ -5,7 +5,7 @@ from jose import JWTError, jwt
 from passlib.context import CryptContext
 from pydantic import ValidationError
 
-from user_service.app.core.config import settings
+from ..core.config import settings
 # Assuming TokenPayload schema will be defined in schemas/token.py
 # from user_service.app.schemas.token import TokenPayload
 

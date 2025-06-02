@@ -9,4 +9,4 @@ COPY . .
 # Expose the port your app listens on
 EXPOSE 8001
 
-CMD ["uvicorn", "user_service.app.main:app", "--host", "0.0.0.0", "--port", "8001"]
+CMD ["python", "-m", "uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8001", "--reload"]

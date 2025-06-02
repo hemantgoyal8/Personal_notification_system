@@ -1,6 +1,7 @@
 fastapi
 uvicorn[standard]
 python-dotenv
+pydantic-settings
 apscheduler
-aio_pika # For async RabbitMQ publishing
-httpx # For async HTTP requests to User Service
+aio_pika 
+httpx 

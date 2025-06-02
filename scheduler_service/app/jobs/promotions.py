@@ -1,13 +1,11 @@
+# scheduler_service/app/jobs/promotions.py
 import logging
 import asyncio
 import random
 
-# Using mock users for simplicity now
-from scheduler_service.app.models.mock_data import mock_users_store, get_random_promotion
-# from scheduler_service.app.clients.user_service import get_user_preferences # Use this if switching to real user service calls
-from scheduler_service.app.events.producer import publish_message
-
-logger = logging.getLogger(__name__)
+from ..models.mock_data import MockUser, mock_users_store, get_random_promotion # Import MockUser for type hinting
+from ..events import producer 
+from ..core.config import settings, logger
 
 async def send_promotional_notifications_job():
     """
@@ -17,53 +15,54 @@ async def send_promotional_notifications_job():
     published_count = 0
     targeted_users = 0
 
-    # Iterate through mock users (replace with User Service call if needed)
-    all_user_ids = list(mock_users_store.keys())
-    
-    # Optional: Select a subset of users for the promotion run
-    # sample_size = min(len(all_user_ids), 5) # Example: target up to 5 users per run
-    # target_user_ids = random.sample(all_user_ids, sample_size)
-    target_user_ids = all_user_ids # Target all mock users for now
+    all_user_keys = list(mock_users_store.keys()) # These keys are user_ids like "user1@example.com"
+    target_user_keys = all_user_keys 
 
-    promotion_content = get_random_promotion()
+    promotion_details = get_random_promotion() 
+    if not promotion_details:
+        logger.warning("No promotions available to send.")
+        return
 
-    for user_id in target_user_ids:
-        user_data = mock_users_store.get(user_id)
+    for user_key in target_user_keys: # user_key is e.g., "user1@example.com"
+        user_data: Optional[MockUser] = mock_users_store.get(user_key) # Get the MockUser object
         
         if not user_data:
-            logger.warning(f"Mock user {user_id} not found.")
+            logger.warning(f"Mock user with key '{user_key}' not found for promotion.")
             continue
 
-        # Fetch preferences (currently from mock data)
-        preferences = user_data.preferences
-        # If using User Service client:
-        # preferences = await get_user_preferences(user_id)
-        # if preferences is None:
-        #     logger.warning(f"Could not fetch preferences for user {user_id}. Skipping promotion.")
-        #     continue
+        # Access the 'preferences' attribute (which is a dict) from the MockUser object
+        preferences_dict = user_data.preferences 
 
-        # Check if user wants promotional notifications
-        if preferences.get("promotions", False): # Default to False if key missing
+        # Check if user wants promotional notifications using .get() on the preferences_dict
+        if preferences_dict.get("promotions", False): 
             targeted_users += 1
-            logger.info(f"User {user_id} is eligible for promotion. Sending...")
+            # Use the userId attribute from the MockUser object for logging and payload
+            user_identifier_for_notification = user_data.userId 
+            logger.info(f"User '{user_identifier_for_notification}' is eligible for promotion. Preparing to send...")
 
-            # Construct notification message
-            notification_payload = {
-                "userId": user_id,
+            message_body = {
+                "user_id": user_identifier_for_notification, 
                 "type": "promotion",
-                "content": promotion_content # Use the selected promotion
+                "title": promotion_details.get("title", "Special Offer!"),
+                "body": promotion_details.get("description", "Check out our latest promotions."),
+                "data": { 
+                    "promotion_id": promotion_details.get("id"),
+                    "discount_code": promotion_details.get("code") 
+                }
             }
+            
+            exchange_name = settings.PROMOTION_EVENTS_EXCHANGE
+            routing_key = f"promotions.user.{user_identifier_for_notification}" # More specific routing key
 
-            # Publish message to RabbitMQ
-            success = await publish_message(notification_payload)
-            if success:
-                published_count += 1
-            else:
-                 logger.error(f"Failed to publish promotion to {user_id}")
-
-            # Optional delay
-            # await asyncio.sleep(0.1)
+            await producer.publish_message(
+                exchange_name=exchange_name,
+                routing_key=routing_key,
+                message_body=message_body
+            )
+            published_count += 1 
+            logger.info(f"Promotion message queued for user '{user_identifier_for_notification}'.")
         else:
-            logger.info(f"User {user_id} opted out of promotions. Skipping.")
+            user_identifier_for_logging = user_data.userId
+            logger.info(f"User '{user_identifier_for_logging}' opted out of promotions or preference not set/found. Skipping.")
 
-    logger.info(f"Promotional notifications job finished. Users targeted: {targeted_users}, Notifications published: {published_count}")
+    logger.info(f"Promotional notifications job finished. Eligible users targeted: {targeted_users}, Notifications queued: {published_count}")

@@ -2,7 +2,7 @@ import logging
 from typing import Optional, Dict, Any, List
 import httpx
 
-from graphql_gateway.app.core.config import settings
+from ..core.config import settings
 
 logger = logging.getLogger(__name__)
 

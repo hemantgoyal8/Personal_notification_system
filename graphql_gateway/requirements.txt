@@ -5,3 +5,4 @@ httpx # Async HTTP client
 python-dotenv
 python-jose[cryptography] # For JWT verification
 pydantic[email] # Good practice
+pydantic-settings

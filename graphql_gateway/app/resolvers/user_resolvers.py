@@ -1,10 +1,12 @@
 import strawberry
+from strawberry.exceptions import GraphQLError
 import logging
-from typing import Optional
+from typing import Optional, Dict, Any
 
-from graphql_gateway.app.schemas_gql.types import UserType, UserUpdateInput, UserPreferencesType, UserPreferencesInput
-from graphql_gateway.app.clients import user_service_client
+from ..schemas_gql.types import UserType, UserUpdateInput, UserPreferencesType
+from ..clients import user_service_client
 from strawberry.types import Info
+from ..auth.context import GraphQLContext
 
 logger = logging.getLogger(__name__)
 
@@ -23,26 +25,54 @@ def _clean_input_data(input_obj):
                 data[field] = value
     return data if data else None # Return None if no fields were set
 
-async def resolve_get_me(info: strawberry.types.Info) -> UserType:
-    """Resolver to get the current authenticated user."""
-    context = info.context
-    if not context.user_id or not context.token:
-        logger.warning("Attempted to access 'me' without authentication.")
-        raise Exception("Authentication required")
-
-    logger.info(f"Fetching 'me' for user: {context.user_id}")
-    user_data = await user_service_client.get_current_user_me(token=context.token)
+async def resolve_get_me(info: Info) -> Optional[UserType]: # Renamed context to actual_context for clarity
+    """
+    Resolver for the 'me' query. Fetches the current authenticated user's details.
+    """
+    actual_context: GraphQLContext = info.context # Get your custom context
     
-    prefs_data = user_data.get("preferences")
-    preferences = UserPreferencesType(**prefs_data) if prefs_data else None
+    if not actual_context.token or not actual_context.user_id: # Check if token/user_id is in context
+        logger.warning("resolve_get_me: Authentication token or user_id missing from context.")
+        raise GraphQLError("Authentication required. Please login.")
 
-    return UserType(
-        id=user_data.get("id", user_data.get("_id")),
-        email=user_data.get("email"),
-        name=user_data.get("name"),
-        preferences=preferences
-    )
+    logger.info(f"resolve_get_me: Fetching details for user_id '{actual_context.user_id}' using token.")
+    
+    try:
+    
+        http_service_client_instance = await actual_context.user_client 
 
+        # Call the client function, passing the http_client and the token
+        user_data_dict: Optional[Dict[str, Any]] = await user_service_client.get_current_user_me(
+            http_client=http_service_client_instance, # Pass the actual client instance
+            token=actual_context.token 
+        )
+        
+        if not user_data_dict:
+            logger.warning(f"resolve_get_me: No user data returned from user service for user_id '{actual_context.user_id}'.")
+          
+            return None
+        
+        preferences_dict_from_service = user_data_dict.get("preferences")
+        user_preferences_obj = None
+        if isinstance(preferences_dict_from_service, dict):
+            try:
+                # Assuming UserPreferencesType can be initialized from this dict
+                user_preferences_obj = UserPreferencesType(**preferences_dict_from_service)
+            except Exception as e_prefs:
+                logger.error(f"resolve_get_me: Error creating UserPreferencesType from {preferences_dict_from_service}: {e_prefs}")
+
+        return UserType(
+            id=str(user_data_dict.get("id")), # Ensure ID is a string
+            email=user_data_dict.get("email"),
+            name=user_data_dict.get("name"),
+            preferences=user_preferences_obj
+        )
+
+    except GraphQLError: # Re-raise GraphQLErrors directly
+        raise
+    except Exception as e:
+        logger.error(f"resolve_get_me: Error fetching 'me' for user_id '{actual_context.user_id}': {e}", exc_info=True)
+        raise GraphQLError(message=str(e))
 
 async def resolve_update_user(info: Info, user_in: UserUpdateInput) -> UserType:
     """Resolver to update the current authenticated user."""

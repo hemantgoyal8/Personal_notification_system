@@ -1,27 +1,64 @@
+# notification_service/main.py
 import logging
 import asyncio
 from fastapi import FastAPI, APIRouter, Request, status
 from fastapi.responses import JSONResponse
 from pydantic import ValidationError
+from contextlib import asynccontextmanager
+from typing import Optional
 
-from notification_service.app.api import notifications
-from notification_service.app.db.database import connect_to_mongo, close_mongo_connection, create_indexes, db # Import db instance
-from notification_service.app.events.consumer import start_consumer_background, stop_consumer_background, rabbitmq_connection # Import consumer functions
-from notification_service.app.core.config import settings
+# Corrected relative imports
+from app.api.notifications import router as notifications_api_router # Assuming 'router' is defined in notifications.py
+from app.db.database import connect_to_mongo, close_mongo_connection, create_indexes_sync # Import the SYNC version
+from app.events import consumer
+from app.core.config import settings, logger 
 
-# Configure logging
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+_background_consumer_task: Optional[asyncio.Task] = None
+
+# app = FastAPI(...) # Will be defined later with lifespan
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    global _background_consumer_task
+    logger.info("Starting up Notification Service (lifespan)...")
+    # Connect to MongoDB (which also calls create_indexes_sync internally)
+    connect_to_mongo() 
+    # create_indexes_sync() # No longer needed here, called by connect_to_mongo
+
+    logger.info("Initiating RabbitMQ consumer startup (lifespan)...")
+    consumer_task = asyncio.create_task(consumer.start_consuming())
+    
+    yield # Application runs here
+    
+    logger.info("Shutting down Notification Service (lifespan)...")
+    # Stop RabbitMQ consumer (if stop_consuming is implemented and needed for graceful shutdown)
+    if hasattr(consumer, 'stop_consuming'): # Check if the function exists
+        logger.info("Attempting to stop consumer task...")
+        await consumer.stop_consuming(consumer_task) # Pass the task to cancel it
+    else:
+        # If no explicit stop, try cancelling the task directly if stored
+        if 'consumer_task' in locals() and consumer_task and not consumer_task.done():
+            consumer_task.cancel()
+            try:
+                await consumer_task
+            except asyncio.CancelledError:
+                logger.info("Consumer task cancelled.")
+
+    # Close MongoDB connection
+    close_mongo_connection()
+    logger.info("Notification Service shutdown complete.")
 
 app = FastAPI(
     title="Notification Service",
     description="Stores and retrieves user notifications, consumes notification events.",
-    version="1.0.0"
+    version="1.0.0",
+    lifespan=lifespan
 )
 
 # Exception Handling
 @app.exception_handler(ValidationError)
 async def validation_exception_handler(request: Request, exc: ValidationError):
+    logger.error(f"Pydantic ValidationError: {exc.errors()}", exc_info=False)
     return JSONResponse(
         status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
         content={"detail": exc.errors()},
@@ -29,72 +66,41 @@ async def validation_exception_handler(request: Request, exc: ValidationError):
 
 @app.exception_handler(Exception)
 async def generic_exception_handler(request: Request, exc: Exception):
-    logger.error(f"Unhandled exception: {exc}", exc_info=True)
+    logger.error(f"Unhandled exception in Notification Service: {exc}", exc_info=True)
     return JSONResponse(
         status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-        content={"detail": "An internal server error occurred"},
+        content={"detail": "An internal server error occurred in Notification Service"},
     )
-
 
 # Include routers
 api_router = APIRouter(prefix="/api/v1")
-api_router.include_router(notifications.router, prefix="/notifications", tags=["Notifications"])
+api_router.include_router(notifications_api_router, prefix="/notifications", tags=["Notifications"])
 app.include_router(api_router)
-
-# Startup and Shutdown events
-@app.on_event("startup")
-async def startup_event():
-    logger.info("Starting up Notification Service...")
-    # Connect to MongoDB
-    connect_to_mongo()
-    try:
-        create_indexes() # Ensure DB indexes exist
-    except Exception as e:
-       logger.error(f"Could not create database indexes: {e}") # Log error but continue startup
-
-    # Start RabbitMQ consumer in background
-    # Using asyncio.create_task to run it concurrently with the FastAPI app
-    logger.info("Initiating RabbitMQ consumer startup...")
-    asyncio.create_task(start_consumer_background())
-
-
-@app.on_event("shutdown")
-async def shutdown_event():
-    logger.info("Shutting down Notification Service...")
-    # Stop RabbitMQ consumer
-    await stop_consumer_background()
-    # Close MongoDB connection
-    close_mongo_connection()
-    logger.info("Notification Service shutdown complete.")
 
 
 @app.get("/health", tags=["Health Check"])
 async def health_check():
-    # Check MongoDB connection
+    from app.db.database import db_conn as mongo_db_connection_wrapper # Import the wrapper
+    
     db_status = "disconnected"
     try:
-        if db.client:
-            db.client.admin.command('ping') # Verify connection
+        # Check if client exists on the wrapper and then ping
+        if mongo_db_connection_wrapper.client: 
+            mongo_db_connection_wrapper.client.admin.command('ping')
             db_status = "connected"
-    except Exception:
-        db_status = "error"
+    except Exception as e:
+        logger.warning(f"Health check: DB ping failed: {e}")
+        db_status = "error_pinging"
 
-    # Check RabbitMQ connection
-    mq_status = "disconnected"
-    if rabbitmq_connection and not rabbitmq_connection.is_closed:
-        mq_status = "connected"
-    elif rabbitmq_connection and rabbitmq_connection.is_closed:
-         mq_status = "closed (reconnecting?)" # connect_robust might be retrying
-    else:
-        mq_status = "error/unavailable"
+    # For RabbitMQ, it's harder to get a live status from an external module's internal connection
+    # without a dedicated status function in consumer.py.
+    # We can assume if the consumer task is running, it's trying.
+    # This is a simplified check.
+    mq_status = "consumer_active (check logs for actual connection status)"
+    # You could add a global flag in consumer.py that start_consuming sets/unsets.
 
+    return {"status": "ok", "service": "Notification Service", "database_status": db_status, "message_queue_status": mq_status}
 
-    return {"status": "ok", "database_status": db_status, "message_queue_status": mq_status}
-
-# Basic root endpoint
 @app.get("/", tags=["Root"])
 async def read_root():
     return {"message": "Welcome to the Notification Service"}
-
-# To run the service (from the 'personalized-notification-system' directory):
-# uvicorn notification_service.app.main:app --reload --port 8001

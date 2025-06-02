@@ -1,7 +1,9 @@
 fastapi
 uvicorn[standard]
+pydantic-settings
 pymongo
 python-jose[cryptography]
 passlib[bcrypt]
 pydantic[email]
 python-dotenv
+python-multipart

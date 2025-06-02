@@ -1,37 +1,38 @@
 version: '3.8'
 services:
-
   rabbitmq:
     image: rabbitmq:3-management
     container_name: rabbitmq
     ports:
-      - "5672:5672"     # AMQP
-      - "15672:15672"   # Management UI
+      - "5672:5672"
+      - "15672:15672"
     environment:
       RABBITMQ_DEFAULT_USER: guest
       RABBITMQ_DEFAULT_PASS: guest
 
-  postgres:
-    image: postgres:15
-    container_name: postgres
-    environment:
-      POSTGRES_USER: postgres
-      POSTGRES_PASSWORD: postgres
-      POSTGRES_DB: notifications
+  mongo: # ADDED MongoDB service
+    image: mongo:latest # Or a specific version like mongo:6.0
+    container_name: mongo_db
     ports:
-      - "5432:5432"
+      - "27017:27017"
     volumes:
-      - postgres_data:/var/lib/postgresql/data
+      - mongo_data:/data/db # Persist MongoDB data
+    # command: mongod --quiet --logpath /dev/null # Optional: reduce mongo verbosity
 
   user_service:
     build:
       context: ./user_service
       dockerfile: Dockerfile
     depends_on:
-      - postgres
+      - mongo # CHANGED from postgres
+      - rabbitmq # ADDED if user_service also publishes/consumes from RabbitMQ
     environment:
-      DATABASE_URL: postgresql://postgres:postgres@postgres:5432/notifications
-      RABBITMQ_URL: amqp://guest:guest@rabbitmq:5672/
+      # CHANGED to MongoDB connection details
+      MONGO_URL: mongodb://mongo_db:27017/ 
+      MONGO_DB_NAME: user_db # Or whatever DB name your user_service uses
+      JWT_SECRET: f47ac10b-58cc-4372-a567-0e02b2c3d479
+      JWT_ALGORITHM: HS256
+      # RABBITMQ_URL: amqp://guest:guest@rabbitmq:5672/ # Add if needed
     ports:
       - "8001:8001"
 
@@ -40,26 +41,31 @@ services:
       context: ./notification_service
       dockerfile: Dockerfile
     depends_on:
-      - postgres
+      - mongo # CHANGED from postgres
       - rabbitmq
     environment:
-      DATABASE_URL: postgresql://postgres:postgres@postgres:5432/notifications
+      # CHANGED to MongoDB connection details
+      MONGO_URL: mongodb://mongo_db:27017/
+      MONGO_DB_NAME: notification_db # Or whatever DB name notification_service uses
       RABBITMQ_URL: amqp://guest:guest@rabbitmq:5672/
-      NOTIFICATION_QUEUE: notification_queue
       NOTIFICATION_EVENTS_EXCHANGE: notification_exchange
-      BINDING_KEY: ""
+      NOTIFICATION_QUEUE: notification_queue
+      BINDING_KEY: "#" # Assuming '#' to catch all on the exchange
     ports:
       - "8002:8002"
 
-  scheduler_service:
+  scheduler_service: # Stays as is if it only uses RabbitMQ
     build:
       context: ./scheduler_service
       dockerfile: Dockerfile
     depends_on:
       - rabbitmq
+      - user_service # ADD if scheduler needs to call user_service via HTTP
     environment:
       RABBITMQ_URL: amqp://guest:guest@rabbitmq:5672/
-    # no ports (internal worker)
+      # Add USER_SERVICE_URL if scheduler client needs to call user_service
+      USER_SERVICE_URL: http://user_service:8001 
+      # ... other scheduler env vars for exchanges ...
 
   graphql_gateway:
     build:
@@ -69,13 +75,15 @@ services:
       - user_service
       - notification_service
     environment:
-      USER_SERVICE_URL: http://user_service:8001
-      NOTIFICATION_SERVICE_URL: http://notification_service:8002
+      USER_SERVICE_BASE_URL: http://user_service:8001
+      NOTIFICATION_SERVICE_BASE_URL: http://notification_service:8002
+      JWT_SECRET_KEY: f47ac10b-58cc-4372-a567-0e02b2c3d479
+      JWT_ALGORITHM: HS256
     ports:
       - "8000:8000"
 
 volumes:
-  postgres_data:
+  mongo_data: # ADDED
 
 networks:
   default:

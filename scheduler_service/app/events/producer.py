@@ -1,152 +1,152 @@
-import json
-import logging
+# scheduler_service/app/events/producer.py
 import asyncio
-from typing import Optional
-
 import aio_pika
-from aio_pika import ExchangeType, Message, RobustConnection
+import json
+from typing import Optional
+from ..core.config import settings, logger # Ensure logger is correctly imported/defined
 
-from scheduler_service.app.core.config import settings
+class RabbitMQProducer:
+    def __init__(self, rabbitmq_url: Optional[str] = None):
+        self.rabbitmq_url = rabbitmq_url or settings.RABBITMQ_URL
+        self._connection: Optional[aio_pika.RobustConnection] = None
+        self._channel: Optional[aio_pika.Channel] = None
+        self._is_connecting = asyncio.Lock() # To prevent multiple concurrent connection attempts
 
-logger = logging.getLogger(__name__)
+    async def connect(self):
+        """Establishes a robust connection and channel to RabbitMQ."""
+        async with self._is_connecting: # Ensure only one coroutine tries to connect at a time
+            if self._channel and not self._channel.is_closed:
+                logger.debug("RabbitMQ channel already active.")
+                return
 
-# Global connection variable
-rabbitmq_connection: Optional[RobustConnection] = None
-rabbitmq_channel: Optional[aio_pika.abc.AbstractChannel] = None
-rabbitmq_exchange: Optional[aio_pika.abc.AbstractExchange] = None
+            try:
+                logger.info(f"Attempting to connect to RabbitMQ at {self.rabbitmq_url}...")
+                if self._connection is None or self._connection.is_closed:
+                    self._connection = await aio_pika.connect_robust(self.rabbitmq_url)
+                    logger.info("Successfully connected to RabbitMQ.")
+                
+                self._channel = await self._connection.channel()
+                logger.info("Successfully obtained RabbitMQ channel.")
+            except Exception as e:
+                logger.error(f"Error connecting to RabbitMQ or getting channel: {e}", exc_info=True)
+                # Reset on significant error to force full reconnect next time
+                if self._channel and not self._channel.is_closed: await self._channel.close()
+                if self._connection and not self._connection.is_closed: await self._connection.close()
+                self._channel = None
+                self._connection = None
+                raise # Re-raise the exception so the caller knows connection failed
 
-
-async def connect_to_rabbitmq() -> bool:
-    """Establishes a robust connection to RabbitMQ."""
-    global rabbitmq_connection
-    if rabbitmq_connection and not rabbitmq_connection.is_closed:
-        logger.info("RabbitMQ connection already established.")
-        return True
-
-    logger.info("Connecting to RabbitMQ for publishing...")
-    try:
-        loop = asyncio.get_event_loop()
-        rabbitmq_connection = await aio_pika.connect_robust(
-            settings.RABBITMQ_URL,
-            loop=loop,
-            timeout=10
-        )
-        rabbitmq_connection.add_close_callback(on_rabbitmq_connection_close)
-        rabbitmq_connection.add_reconnect_callback(on_rabbitmq_connection_reconnect)
-        logger.info("RabbitMQ connection successful.")
-        # Get channel and declare exchange after connection
-        await setup_rabbitmq_channel_and_exchange()
-        return True
-    except aio_pika.exceptions.AMQPConnectionError as e:
-        logger.error(f"Could not connect to RabbitMQ: {e}")
-        rabbitmq_connection = None
-        return False
-    except Exception as e:
-        logger.error(f"Generic error connecting to RabbitMQ: {e}")
-        rabbitmq_connection = None
-        return False
-
-def on_rabbitmq_connection_close(sender, exc):
-    global rabbitmq_connection, rabbitmq_channel, rabbitmq_exchange
-    logger.warning(f"RabbitMQ connection closed. Exception: {exc}. Resetting channel and exchange.")
-    rabbitmq_connection = None
-    rabbitmq_channel = None
-    rabbitmq_exchange = None
-
-async def on_rabbitmq_connection_reconnect(sender):
-    global rabbitmq_connection
-    logger.info("RabbitMQ connection re-established. Setting up channel and exchange again.")
-    # Re-setup channel and exchange on reconnect
-    await setup_rabbitmq_channel_and_exchange()
+    async def send_message(self, exchange_name: str, routing_key: str, message_body: dict):
+        """
+        Publishes a message to the specified RabbitMQ exchange.
+        Ensures connection and channel are active.
+        """
+        if self._channel is None or self._channel.is_closed:
+            logger.warning("RabbitMQ channel not available for send_message. Attempting to connect...")
+            await self.connect() # Attempt to reconnect/re-establish channel
+            if self._channel is None or self._channel.is_closed: # Check again after attempt
+                logger.error(f"Still cannot send message, RabbitMQ channel unavailable for exchange '{exchange_name}'.")
+                raise ConnectionError("RabbitMQ channel unavailable after attempting to connect.")
 
 
-async def setup_rabbitmq_channel_and_exchange():
-    """Sets up the channel and declares the exchange."""
-    global rabbitmq_channel, rabbitmq_exchange, rabbitmq_connection
-    if not rabbitmq_connection or rabbitmq_connection.is_closed:
-        logger.error("Cannot setup channel/exchange, RabbitMQ connection not available.")
-        return False
-
-    try:
-        # Create a channel
-        rabbitmq_channel = await rabbitmq_connection.channel()
-        logger.info("RabbitMQ channel obtained.")
-
-        # Declare the exchange (idempotent)
-        exchange_type = ExchangeType(settings.NOTIFICATION_EXCHANGE_TYPE) # Convert string to Enum
-        rabbitmq_exchange = await rabbitmq_channel.declare_exchange(
-            settings.NOTIFICATION_EVENTS_EXCHANGE,
-            exchange_type,
-            durable=True # Make exchange survive broker restarts
-        )
-        logger.info(f"Declared RabbitMQ Exchange '{settings.NOTIFICATION_EVENTS_EXCHANGE}' type '{settings.NOTIFICATION_EXCHANGE_TYPE}'.")
-        return True
-    except Exception as e:
-        logger.error(f"Error setting up RabbitMQ channel/exchange: {e}")
-        rabbitmq_channel = None
-        rabbitmq_exchange = None
-        return False
-
-async def publish_message(message_body: dict, routing_key: str = ""):
-    """Publishes a message to the configured RabbitMQ exchange."""
-    global rabbitmq_exchange, rabbitmq_channel
-
-    if not rabbitmq_channel or rabbitmq_channel.is_closed:
-        logger.warning("RabbitMQ channel is not available. Attempting to reconnect/re-setup...")
-        # Attempt to re-establish connection and channel
-        if await connect_to_rabbitmq():
-             await setup_rabbitmq_channel_and_exchange() # Try setting up again
-        
-        # Check again after attempting setup
-        if not rabbitmq_channel or rabbitmq_channel.is_closed:
-             logger.error("Failed to publish message: RabbitMQ channel unavailable after retry.")
-             return False # Indicate publish failure
-
-
-    if not rabbitmq_exchange:
-        logger.error("Failed to publish message: RabbitMQ exchange is not configured/available.")
-        return False
-
-    try:
-        message = Message(
-            body=json.dumps(message_body).encode('utf-8'),
-            content_type="application/json",
-            delivery_mode=aio_pika.DeliveryMode.PERSISTENT # Make message persistent
-        )
-        
-        # Publish the message
-        # Routing key is typically empty for FANOUT, specify for DIRECT/TOPIC
-        await rabbitmq_exchange.publish(message, routing_key=routing_key)
-        # logger.info(f"Published message to exchange '{settings.NOTIFICATION_EVENTS_EXCHANGE}': {message_body}")
-        return True
-    except Exception as e:
-        logger.error(f"Failed to publish message: {e}. Message: {message_body}", exc_info=True)
-        # Handle potential channel/connection closure on error
-        if isinstance(e, (aio_pika.exceptions.ChannelClosed, aio_pika.exceptions.ConnectionClosed)):
-             logger.warning("Channel or connection closed during publish. Resetting state.")
-             rabbitmq_channel = None
-             rabbitmq_exchange = None
-             # Connection reset handled by robust connection callbacks hopefully
-        return False
-
-async def close_rabbitmq_connection():
-    """Closes the RabbitMQ connection."""
-    global rabbitmq_connection, rabbitmq_channel
-    logger.info("Closing RabbitMQ connection...")
-    if rabbitmq_channel and not rabbitmq_channel.is_closed:
         try:
-            await rabbitmq_channel.close()
-            logger.info("RabbitMQ channel closed.")
+            logger.debug(f"Declaring exchange: '{exchange_name}' (type: DIRECT, durable: True)")
+            exchange = await self._channel.declare_exchange(
+                name=exchange_name,
+                type=aio_pika.ExchangeType.DIRECT, # Or TOPIC, FANOUT
+                durable=True
+            )
+            
+            message_json = json.dumps(message_body)
+            message = aio_pika.Message(
+                body=message_json.encode(),
+                content_type="application/json",
+                delivery_mode=aio_pika.DeliveryMode.PERSISTENT
+            )
+            
+            logger.info(f"Publishing message to exchange '{exchange_name}', routing_key '{routing_key}'")
+            await exchange.publish(message, routing_key=routing_key)
+            logger.debug(f"Message published successfully to '{exchange_name}' with key '{routing_key}'.")
+            return True # Indicate success
         except Exception as e:
-             logger.error(f"Error closing RabbitMQ channel: {e}")
+            logger.error(f"Failed to publish message to '{exchange_name}': {e}", exc_info=True)
+            return False # Indicate failure
 
-    if rabbitmq_connection and not rabbitmq_connection.is_closed:
-        try:
-            await rabbitmq_connection.close()
-            logger.info("RabbitMQ connection closed.")
-        except Exception as e:
-             logger.error(f"Error closing RabbitMQ connection: {e}")
-    
-    rabbitmq_connection = None
-    rabbitmq_channel = None
-    rabbitmq_exchange = None
+    async def close(self):
+        """Closes the RabbitMQ channel and connection."""
+        closed_something = False
+        if self._channel and not self._channel.is_closed:
+            try:
+                await self._channel.close()
+                logger.info("RabbitMQ channel closed by producer instance.")
+                closed_something = True
+            except Exception as e:
+                logger.error(f"Error closing RabbitMQ channel in producer instance: {e}", exc_info=True)
+        
+        if self._connection and not self._connection.is_closed:
+            try:
+                await self._connection.close()
+                logger.info("RabbitMQ connection closed by producer instance.")
+                closed_something = True
+            except Exception as e:
+                logger.error(f"Error closing RabbitMQ connection in producer instance: {e}", exc_info=True)
+        
+        if closed_something:
+            self._connection = None
+            self._channel = None
+
+# --- Standalone functions for other jobs if they don't use the class ---
+# You might choose to have ALL jobs use the RabbitMQProducer class,
+# or keep these standalone functions if order_updates and promotions prefer them.
+# If you keep these, they need their own connection management or to use a shared producer instance.
+
+_standalone_producer_instance: Optional[RabbitMQProducer] = None
+_standalone_producer_lock = asyncio.Lock()
+
+async def get_standalone_producer() -> RabbitMQProducer:
+    """Gets a shared instance of RabbitMQProducer."""
+    global _standalone_producer_instance
+    async with _standalone_producer_lock:
+        if _standalone_producer_instance is None:
+            _standalone_producer_instance = RabbitMQProducer()
+
+        if _standalone_producer_instance._channel is None or _standalone_producer_instance._channel.is_closed:
+            try:
+                await _standalone_producer_instance.connect()
+            except Exception as e:
+                logger.error(f"Failed to connect standalone producer: {e}")
+                # Don't return it if connection failed
+                raise ConnectionError(f"Failed to connect standalone producer: {e}") from e
+    return _standalone_producer_instance
+
+async def get_rabbitmq_channel() -> Optional[aio_pika.Channel]: # RE-ADD THIS FUNCTION
+    """Convenience function to get the channel from the standalone producer."""
+    try:
+        producer_instance = await get_standalone_producer()
+        return producer_instance._channel # Access the channel directly
+    except ConnectionError:
+        return None # If producer couldn't connect
+    except Exception as e:
+        logger.error(f"Error obtaining channel via get_rabbitmq_channel: {e}", exc_info=True)
+        return None
+            
+
+async def publish_message(exchange_name: str, routing_key: str, message_body: dict) -> bool:
+    """Standalone publish_message function using a shared producer instance."""
+    try:
+        producer_instance = await get_standalone_producer()
+        return await producer_instance.send_message(exchange_name, routing_key, message_body)
+    except ConnectionError: # Raised by producer.send_message if channel is unavailable
+        logger.error(f"ConnectionError in standalone publish_message for {exchange_name}/{routing_key}.")
+        return False
+    except Exception as e:
+        logger.error(f"Unexpected error in standalone publish_message: {e}", exc_info=True)
+        return False
+
+async def close_rabbitmq_connection(): # This would close the shared standalone instance
+    """Closes the shared standalone producer instance's connection."""
+    global _standalone_producer_instance
+    if _standalone_producer_instance:
+        logger.info("Closing standalone RabbitMQ producer connection...")
+        await _standalone_producer_instance.close()
+        _standalone_producer_instance = None

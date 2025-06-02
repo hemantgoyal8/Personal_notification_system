@@ -2,8 +2,8 @@ import logging
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.interval import IntervalTrigger
 
-from scheduler_service.app.core.config import settings
-from scheduler_service.app.jobs import order_updates, promotions
+from .core.config import settings, logger
+from .jobs import order_updates, promotions
 
 logger = logging.getLogger(__name__)
 

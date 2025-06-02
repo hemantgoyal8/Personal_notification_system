@@ -1,72 +1,65 @@
+# notification_service/app/db/database.py
 from pymongo import MongoClient
-from pymongo.errors import ConnectionFailure, ServerSelectionTimeoutError
-from notification_service.app.core.config import settings
-import logging
-from bson import ObjectId
+from pymongo.database import Database # Correct type hint
+from pymongo.errors import ConnectionFailure
+from ..core.config import settings, logger 
+from typing import Optional, Any, Dict
 
-logger = logging.getLogger(__name__)
+class DBConnection:
+    client: Optional[MongoClient] = None
+    db: Optional[Database] = None # Use imported Database type
 
-class MongoDB:
-    client: MongoClient = None
-
-db = MongoDB()
+db_conn = DBConnection()
 
 def connect_to_mongo():
-    logger.info("Connecting to MongoDB...")
+    logger.info(f"Notification Service DB: Connecting to MongoDB at {settings.MONGO_URL} using database {settings.MONGO_DB_NAME}...")
     try:
-        db.client = MongoClient(
-            settings.MONGO_DETAILS,
-            serverSelectionTimeoutMS=5000 # Timeout after 5 seconds
-        )
-        # The ismaster command is cheap and does not require auth.
-        db.client.admin.command('ismaster')
-        logger.info("MongoDB connection successful.")
-        database = db.client[settings.DATABASE_NAME]
-        return database
-    except (ConnectionFailure, ServerSelectionTimeoutError) as e:
-        logger.error(f"Could not connect to MongoDB: {e}")
-        raise SystemExit(f"Failed to connect to MongoDB: {e}")
-
-def close_mongo_connection():
-    logger.info("Closing MongoDB connection...")
-    if db.client:
-        db.client.close()
-        logger.info("MongoDB connection closed.")
-
-def get_database():
-    if db.client is None:
-        logger.warning("MongoDB client is not initialized. Attempting connection.")
-        return connect_to_mongo()
-    try:
-        # Verify connection before returning
-        db.client.admin.command('ping')
-        return db.client[settings.DATABASE_NAME]
+        db_conn.client = MongoClient(settings.MONGO_URL, serverSelectionTimeoutMS=10000)
+        db_conn.client.admin.command('ping') 
+        db_conn.db = db_conn.client[settings.MONGO_DB_NAME]
+        logger.info("Notification Service: Successfully connected to MongoDB.")
+        create_indexes_sync() 
     except ConnectionFailure as e:
-         logger.error(f"MongoDB connection lost: {e}. Attempting reconnect...")
-         return connect_to_mongo() # Attempt to reconnect
+        logger.error(f"Notification Service: Could not connect to MongoDB: {settings.MONGO_URL} - {e}", exc_info=True)
+        raise SystemExit(f"Notification Service: Failed to connect to MongoDB: {e}")
+    except Exception as e:
+        logger.error(f"Notification Service: An unexpected error occurred connecting to MongoDB: {e}", exc_info=True)
+        raise SystemExit(f"Notification Service: Unexpected error connecting to MongoDB: {e}")
 
+def close_mongo_connection(): 
+    if db_conn.client:
+        logger.info("Notification Service: Closing MongoDB connection...")
+        db_conn.client.close()
+        logger.info("Notification Service: MongoDB connection closed.")
 
 def get_notification_collection():
-    database = get_database()
-    return database.notifications
+    if db_conn.db is None: # Correct check
+        logger.error("Notification Service: MongoDB database not initialized.")
+        raise RuntimeError("Notification Service: Database not initialized.")
+    return db_conn.db["notifications"]
 
-def create_indexes():
-    """Creates necessary indexes for the notifications collection."""
-    try:
-        collection = get_notification_collection()
-        collection.create_index([("userId", 1), ("sentAt", -1)]) # Index for fetching user's notifications sorted
-        collection.create_index([("userId", 1), ("read", 1)]) # Index for fetching unread notifications
-        logger.info("Notification collection indexes ensured.")
-    except Exception as e:
-        logger.error(f"Error creating indexes for notifications collection: {e}")
+def notification_helper(notification_doc: Dict[str, Any]) -> Dict[str, Any]:
+    if notification_doc and "_id" in notification_doc:
+        return {
+            "id": str(notification_doc["_id"]),
+            "userId": notification_doc.get("userId"),
+            "type": notification_doc.get("type"),
+            "content": notification_doc.get("content"),
+            "sentAt": notification_doc.get("sentAt"), 
+            "read": notification_doc.get("read", False)
+        }
+    return notification_doc if notification_doc else {}
 
-# Helper to convert MongoDB document _id (ObjectId) to string
-def notification_helper(notification) -> dict:
-    return {
-        "id": str(notification["_id"]),
-        "userId": notification["userId"],
-        "type": notification["type"],
-        "content": notification["content"],
-        "sentAt": notification["sentAt"],
-        "read": notification["read"],
-    }
+def create_indexes_sync():
+    if db_conn.db is not None: # Correct check
+        logger.info("Notification Service: Creating MongoDB indexes for 'notifications' collection...")
+        try:
+            collection = db_conn.db["notifications"]
+            collection.create_index([("userId", 1)])
+            collection.create_index([("userId", 1), ("read", 1)])
+            collection.create_index([("sentAt", -1)])
+            logger.info("Notification Service: Indexes ensured for 'notifications' collection.")
+        except Exception as e:
+            logger.error(f"Notification Service: Error creating indexes: {e}", exc_info=True)
+    else:
+        logger.warning("Notification Service: MongoDB not connected. Skipping index creation.")

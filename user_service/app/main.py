@@ -1,26 +1,35 @@
 import logging
-from fastapi import FastAPI, APIRouter, HTTPException, Request, status
+from fastapi import FastAPI, APIRouter, Request, status
 from fastapi.responses import JSONResponse
-
-from user_service.app.api import users, auth
-from user_service.app.db.database import connect_to_mongo, close_mongo_connection, create_indexes # Added index creation
-from user_service.app.core.config import settings
-from user_service.app.schemas.user import UserInDB 
+from contextlib import asynccontextmanager
+from .api import users, auth
+from .db.database import connect_to_mongo, close_mongo_connection
+from .core.config import settings, logger
+from pydantic import ValidationError
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+@asynccontextmanager
+async def lifespan(app_lifespan: FastAPI): 
+    logger.info("Starting up User Service (lifespan)...")
+    connect_to_mongo() # This function internally calls create_indexes_sync()
+    yield
+    logger.info("Shutting down User Service (lifespan)...")
+    close_mongo_connection()
+
+
 app = FastAPI(
     title="User Service",
     description="Manages users, authentication, and preferences.",
-    version="1.0.0"
+    version="1.0.0",
+    lifespan=lifespan
 )
 
-# Exception Handling (Example for validation errors)
-from pydantic import ValidationError
 @app.exception_handler(ValidationError)
 async def validation_exception_handler(request: Request, exc: ValidationError):
+    logger.error(f"Pydantic ValidationError: {exc.errors()}", exc_info=False)
     return JSONResponse(
         status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
         content={"detail": exc.errors()},
@@ -30,46 +39,26 @@ async def validation_exception_handler(request: Request, exc: ValidationError):
 api_router = APIRouter(prefix="/api/v1")
 api_router.include_router(auth.router, prefix="/auth", tags=["Authentication"])
 api_router.include_router(users.router, prefix="/users", tags=["Users"])
-
 app.include_router(api_router)
-
-# Startup and Shutdown events
-@app.on_event("startup")
-async def startup_event():
-    logger.info("Starting up User Service...")
-    connect_to_mongo()
-    # Optional: Ensure indexes are created on startup
-    # try:
-    #    create_indexes() # Make sure this function exists in database.py
-    # except Exception as e:
-    #    logger.error(f"Could not create database indexes: {e}")
-
-@app.on_event("shutdown")
-async def shutdown_event():
-    logger.info("Shutting down User Service...")
-    close_mongo_connection()
 
 @app.get("/health", tags=["Health Check"])
 async def health_check():
-    from user_service.app.db.database import db  # Import the db instance
-    # Optionally add checks for DB connection status
+    from .db.database import client as mongo_client
+    db_status = "disconnected"
     try:
-        # Simple check if client exists
-        if db.client:
+        if mongo_client:
              # More robust check
-             db.client.admin.command('ping')
+             mongo_client.admin.command('ping')
              db_status = "connected"
         else:
              db_status = "disconnected"
-    except Exception:
+    except Exception as e:
+        logger.error(f"Health check: DB ping failed: {e}")
         db_status = "error"
 
-    return {"status": "ok", "database_status": db_status}
+    return {"status": "ok", "service":"User Service", "database_status": db_status}
 
 # Basic root endpoint
 @app.get("/", tags=["Root"])
 async def read_root():
     return {"message": "Welcome to the User Service"}
-
-# To run the service (from the 'personalized-notification-system' directory):
-# uvicorn user_service.app.main:app --reload --port 8000

@@ -3,9 +3,9 @@ import logging
 from typing import List, Optional
 from datetime import datetime
 
-from graphql_gateway.app.schemas_gql.types import NotificationType, NotificationContentType, MarkReadResponseType
-from graphql_gateway.app.clients import notification_service_client
-from graphql_gateway.app.auth.context import GraphQLContext
+from ..schemas_gql.types import NotificationType, NotificationContentType, MarkReadResponseType
+from ..clients import notification_service_client
+from ..auth.context import GraphQLContext
 
 logger = logging.getLogger(__name__)
 

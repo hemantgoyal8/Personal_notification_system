@@ -4,11 +4,11 @@ from jose import JWTError
 from pydantic import ValidationError
 from typing import Optional
 
-from user_service.app.core import security
-from user_service.app.core.config import settings
-from user_service.app.schemas.token import TokenPayload
-from user_service.app.schemas.user import User # We need the User schema
-from user_service.app.db import crud # Use the synchronous crud for now
+from ..core import security
+from ..core.config import settings
+from ..schemas.token import TokenPayload
+from ..schemas.user import User # We need the User schema
+from ..db import crud # Use the synchronous crud for now
 
 # Define the OAuth2 scheme pointing to the login endpoint
 # The tokenUrl should be the path to your login endpoint relative to the root

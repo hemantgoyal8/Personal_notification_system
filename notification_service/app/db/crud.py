@@ -3,8 +3,8 @@ from bson import ObjectId
 from typing import List, Optional
 from datetime import datetime
 
-from notification_service.app.db.database import get_notification_collection, notification_helper
-from notification_service.app.schemas.notification import NotificationCreate, NotificationInDB
+from ..db.database import get_notification_collection
+from ..schemas.notification import NotificationCreate, NotificationInDB
 import logging
 
 logger = logging.getLogger(__name__)
